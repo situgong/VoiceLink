@@ -183,6 +183,41 @@ More voices and additional AI models are planned for future releases.
 
 <br>
 
+## ⚙️ Device Selection
+
+You can control which device the Kokoro voice model runs on with the `VOICELINK_MODEL__DEVICE` environment variable (or the **Device** dropdown in the app's Settings page):
+
+```
+VOICELINK_MODEL__DEVICE=auto|cpu|cuda|amd
+```
+
+- **`auto`** (default) — picks the best available device: CUDA first, then DirectML, then CPU
+- **`cpu`** — always run on the CPU
+- **`cuda`** — force an NVIDIA GPU (CUDA)
+- **`amd`** — force an AMD/Intel GPU via DirectML (Windows only)
+
+### AMD / Intel GPU Setup (DirectML)
+
+`amd` mode uses [torch-directml](https://learn.microsoft.com/en-us/windows/ai/directml/gpu-tensorflow-plugin). To set it up in the server's Python environment:
+
+```powershell
+pip install "torch<2.9"     # torch-directml requires torch < 2.9
+pip install torch-directml  # order matters: install torch first
+```
+
+Then set `VOICELINK_MODEL__DEVICE=amd` and restart the server. The line is also listed (commented out) in `server/requirements.txt`.
+
+### Fallback Behavior
+
+Device selection never crashes the server. If the requested device is unavailable (e.g. `cuda` on a machine without an NVIDIA GPU, or `amd` without torch-directml installed), the server logs a warning and falls back to the CPU so TTS keeps working.
+
+### Checking Which Device Is In Use
+
+- **At runtime:** query the health endpoint — `GET http://127.0.0.1:7860/v1/health` — and look at the `device_kind` and `device_name` fields (e.g. `device_kind: "cuda"`, `device_name: "NVIDIA GeForce RTX 4080"`). The Dashboard also shows the resolved device.
+- **At startup:** the server logs which device was resolved and whether any fallback occurred.
+
+<br>
+
 ## 📊 Project Status
 
 VoiceLink is functional and usable today. Here is where things stand:

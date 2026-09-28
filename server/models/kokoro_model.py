@@ -156,12 +156,17 @@ class KokoroModel(TTSModel):
         """
         Args:
             lang_code: Kokoro language code. 'a' = American, 'b' = British.
-            device: 'auto', 'cuda', or 'cpu'.
+            device: 'auto', 'cuda' (NVIDIA), 'amd' (DirectML), or 'cpu'.
         """
         self._lang_code = lang_code
         self._device = device
         self._pipeline = None
         self._loaded = False
+        # Resolved device after load() — set by resolve_device() so
+        # /v1/health can report what the model ACTUALLY runs on
+        # (GPU availability ≠ device in use). None until loaded.
+        self._device_kind: str | None = None
+        self._device_name: str | None = None
 
     def load(self) -> None:
         """Load the Kokoro pipeline (downloads model on first run)."""
@@ -171,9 +176,55 @@ class KokoroModel(TTSModel):
 
         logger.info(f"Loading Kokoro model (lang={self._lang_code})...")
 
+        import inspect
+
         from kokoro import KPipeline
 
-        self._pipeline = KPipeline(lang_code=self._lang_code)
+        from server.models.device_utils import resolve_device
+
+        # Resolve CPU / NVIDIA CUDA / AMD (DirectML on Windows) up front.
+        # resolve_device() never raises — it falls back to CPU with a
+        # warning if the requested backend is unavailable.
+        torch_device, kind, device_name = resolve_device(self._device)
+        logger.info(f"Kokoro inference device: {kind} ({device_name})")
+
+        # Record the RESOLVED device so /v1/health can report the device
+        # actually in use, not just which GPUs exist on the machine.
+        self._device_kind = kind
+        self._device_name = device_name
+
+        # Newer kokoro releases (>= 0.9) accept device= in KPipeline.
+        # Older ones don't, so we probe the signature and fall back to
+        # building a KModel ourselves and handing it to the pipeline.
+        accepts_device = "device" in inspect.signature(KPipeline.__init__).parameters
+
+        # ====================================================================
+        # WHY: DirectML (AMD/Intel GPU on Windows) is FORCED down the
+        # explicit KModel path even when KPipeline accepts device=.
+        # torch-directml returns a private torch device object, and
+        # kokoro's device handling (e.g. device string checks like
+        # `device == "cuda"`) is unverified with such objects — it may
+        # silently fall back to CPU or misroute tensors. Building
+        # KModel().to(torch_device) explicitly is the verified-safe
+        # route for DML. The signature probe stays for cpu/cuda.
+        # ====================================================================
+        if kind == "dml":
+            from kokoro import KModel
+
+            model = KModel()
+            model.to(torch_device).eval()
+            self._pipeline = KPipeline(lang_code=self._lang_code, model=model)
+        elif accepts_device:
+            self._pipeline = KPipeline(
+                lang_code=self._lang_code, device=torch_device
+            )
+        else:
+            from kokoro import KModel
+
+            model = KModel()
+            model.to(torch_device).eval()
+            self._pipeline = KPipeline(lang_code=self._lang_code, model=model)
+
         self._loaded = True
 
         logger.info("Kokoro model loaded successfully.")
@@ -184,6 +235,18 @@ class KokoroModel(TTSModel):
             del self._pipeline
             self._pipeline = None
             self._loaded = False
+            # Clear resolved-device reporting so /v1/health stops claiming
+            # a device the model no longer runs on.
+            self._device_kind = None
+            self._device_name = None
+            # Release GPU memory promptly (no-op on CPU).
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             logger.info("Kokoro model unloaded.")
 
     def synthesize(
@@ -268,6 +331,22 @@ class KokoroModel(TTSModel):
     @property
     def model_name(self) -> str:
         return "Kokoro"
+
+    # ========================================================================
+    # WHY: Resolved-device reporting for /v1/health. GPU *availability*
+    # (current_gpu_summary) tells you what hardware exists; these tell
+    # you what device the model actually loaded on after resolution and
+    # any CPU fallback. None/None before load().
+    # ========================================================================
+    @property
+    def resolved_device_kind(self) -> str | None:
+        """'cpu' | 'cuda' | 'dml' after load(); None before load()."""
+        return self._device_kind
+
+    @property
+    def resolved_device_name(self) -> str | None:
+        """Human-readable name of the resolved device; None before load()."""
+        return self._device_name
 
     @property
     def is_loaded(self) -> bool:

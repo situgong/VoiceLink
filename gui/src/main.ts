@@ -14,6 +14,8 @@ interface ServerHealth {
   model_loaded: boolean;
   gpu_available: boolean;
   gpu_name: string | null;
+  device_kind: string | null;
+  device_name: string | null;
   uptime_seconds: number;
 }
 
@@ -55,6 +57,7 @@ interface AppSettings {
   qwen3_enabled: boolean;
   qwen3_model_tier: string;
   qwen3_installed: boolean;
+  device: string;
 }
 
 interface SetupStatus {
@@ -468,7 +471,17 @@ async function checkServerStatus() {
       indicator?.classList.add("online");
       if (statusEl) statusEl.textContent = "Running";
       if (modelEl) modelEl.textContent = result.health.model ?? "—";
-      if (deviceEl) deviceEl.textContent = result.health.gpu_name ?? (result.health.gpu_available ? "GPU" : "CPU");
+      if (deviceEl) {
+        const kind = result.health.device_kind;
+        const name = result.health.device_name;
+        if (name) {
+          // Prefer the resolved device reported by newer servers
+          deviceEl.textContent = kind ? `${kind} — ${name}` : name;
+        } else {
+          // Fallback for older servers without device_kind/device_name
+          deviceEl.textContent = result.health.gpu_name ?? (result.health.gpu_available ? "GPU" : "CPU");
+        }
+      }
       if (voicesEl) voicesEl.textContent = formatUptime(result.health.uptime_seconds);
       updateServerToggle(toggleBtn, true);
     } else if (result.running) {
@@ -792,6 +805,54 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
     input.addEventListener("keydown", onKey);
+  });
+}
+
+/** Confirmation dialog (OK / Cancel, no text input) built on the shared modal */
+function showConfirm(title: string, message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById("modal-overlay")!;
+    const titleEl = document.getElementById("modal-title")!;
+    const input = document.getElementById("modal-input") as HTMLInputElement;
+    const okBtn = document.getElementById("modal-ok")!;
+    const cancelBtn = document.getElementById("modal-cancel")!;
+
+    titleEl.textContent = title;
+    overlay.classList.remove("hidden");
+
+    // Get or create a message element (same as showModal's alert-only mode)
+    let msgEl = document.getElementById("modal-message");
+    if (!msgEl) {
+      msgEl = document.createElement("p");
+      msgEl.id = "modal-message";
+      msgEl.style.cssText = "margin: 8px 0 16px; color: var(--text-secondary); font-size: 13px; line-height: 1.5;";
+      input.parentElement!.insertBefore(msgEl, input);
+    }
+
+    input.style.display = "none";
+    msgEl.style.display = "";
+    msgEl.textContent = message;
+    okBtn.textContent = "OK";
+    cancelBtn.style.display = "";
+
+    function cleanup() {
+      overlay.classList.add("hidden");
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+    }
+
+    function onOk() {
+      cleanup();
+      resolve(true);
+    }
+
+    function onCancel() {
+      cleanup();
+      resolve(false);
+    }
+
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
   });
 }
 
@@ -1207,6 +1268,7 @@ function setupRefreshButton() {
 async function setupSettings() {
   const toggle = document.getElementById("setting-autostart") as HTMLInputElement | null;
   const portInput = document.getElementById("setting-server-url") as HTMLInputElement | null;
+  const deviceSelect = document.getElementById("setting-device") as HTMLSelectElement | null;
 
   // Load current persisted settings
   let settings: AppSettings | null = null;
@@ -1234,6 +1296,40 @@ async function setupSettings() {
     } catch (e) {
       console.error("Failed to set autostart:", e);
       toggle.checked = !toggle.checked;
+    }
+  });
+
+  // Apply persisted device setting (default "auto" when absent)
+  if (deviceSelect) deviceSelect.value = settings?.device || "auto";
+
+  // Handle device selection changes
+  deviceSelect?.addEventListener("change", async () => {
+    if (!deviceSelect) return;
+    try {
+      await invoke("save_settings", { device: deviceSelect.value });
+
+      // If the server is running, offer to restart so the new device takes effect
+      try {
+        const status: ServerStatus = await invoke("get_server_status");
+        if (status.running) {
+          const restart = await showConfirm(
+            "Restart Server",
+            "Restart the server now to apply the new device?"
+          );
+          if (restart) {
+            await invoke("stop_server");
+            await invoke("start_server");
+            // Give the server a moment to boot before re-checking
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+      } catch (statusErr) {
+        console.error("Server status check failed:", statusErr);
+      }
+
+      await checkServerStatus();
+    } catch (e) {
+      console.error("Failed to save device setting:", e);
     }
   });
 

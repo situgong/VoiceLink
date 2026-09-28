@@ -72,7 +72,12 @@ class ModelSettings(BaseSettings):
     # Device selection
     device: str = Field(
         default="auto",
-        description="Device: 'auto' (GPU if available, else CPU), 'cuda', 'cpu'.",
+        description=(
+            "Inference device: "
+            "'auto' (CUDA if available, else DirectML/AMD, else CPU), "
+            "'cpu', 'cuda' (NVIDIA), or 'amd' (AMD GPU via torch-directml "
+            "on Windows; install with: pip install torch-directml)."
+        ),
     )
 
     # Where to store downloaded models

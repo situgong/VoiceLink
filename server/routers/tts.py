@@ -91,6 +91,27 @@ class HealthResponse(BaseModel):
     model_loaded: bool        # Is the model ready?
     gpu_available: bool       # Is CUDA available?
     gpu_name: str | None      # GPU device name
+    # ========================================================================
+    # WHY: gpu_available/gpu_name report which GPUs EXIST on the machine;
+    # these report which device the model ACTUALLY loaded on after
+    # resolution and fallback. device_kind is "cpu" | "cuda" | "dml"
+    # (DirectML / AMD-Intel GPU) — never null once the model is loaded,
+    # null only pre-load. Older clients ignore unknown fields.
+    # ========================================================================
+    device_kind: str | None = Field(
+        default=None,
+        description=(
+            "Device kind the model actually runs on after resolution: "
+            "'cpu', 'cuda', or 'dml' (DirectML). Null if no model is loaded."
+        ),
+    )
+    device_name: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable name of the device the model actually runs on "
+            "(e.g. 'AMD Radeon RX 7900 XTX'). Null if no model is loaded."
+        ),
+    )
     uptime_seconds: float     # Seconds since server started
 
 
@@ -246,10 +267,18 @@ async def health_check():
     Returns status, loaded model info, GPU availability, and uptime.
     Used by COM DLL to verify server is alive before sending TTS requests.
     """
-    import torch
+    from server.models.device_utils import current_gpu_summary
 
-    gpu_available = torch.cuda.is_available()
-    gpu_name = torch.cuda.get_device_name(0) if gpu_available else None
+    # Covers NVIDIA CUDA and AMD/Intel DirectML, not just torch.cuda.
+    gpu_available, gpu_name = current_gpu_summary()
+
+    # ====================================================================
+    # WHY getattr: not every model backend (e.g. a future Qwen3 model)
+    # exposes resolved_device_kind — the health route must not crash
+    # on those. Only KokoroModel reports an actual-device field today.
+    # ====================================================================
+    device_kind = getattr(_model, "resolved_device_kind", None) if _model is not None else None
+    device_name = getattr(_model, "resolved_device_name", None) if _model is not None else None
 
     return HealthResponse(
         status="ok" if (_model is not None and _model.is_loaded) else "loading",
@@ -257,5 +286,7 @@ async def health_check():
         model_loaded=_model.is_loaded if _model is not None else False,
         gpu_available=gpu_available,
         gpu_name=gpu_name,
+        device_kind=device_kind,
+        device_name=device_name,
         uptime_seconds=time.time() - _start_time,
     )

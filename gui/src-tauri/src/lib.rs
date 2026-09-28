@@ -96,6 +96,12 @@ struct AppConfig {
     qwen3_model_tier: String, // "standard" (0.6B) or "full" (1.7B)
     #[serde(default)]
     qwen3_installed: bool,
+    #[serde(default = "default_device")]
+    device: String, // "auto" | "cpu" | "cuda" | "amd" (TTS device selection)
+}
+
+fn default_device() -> String {
+    "auto".to_string()
 }
 
 fn default_qwen3_tier() -> String {
@@ -120,6 +126,7 @@ impl Default for AppConfig {
             qwen3_enabled: false,
             qwen3_model_tier: "standard".to_string(),
             qwen3_installed: false,
+            device: "auto".to_string(),
         }
     }
 }
@@ -1572,6 +1579,10 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         .args(["-c", bootstrap.trim()])
         .current_dir(cfg.data_dir())
         .env("PYTHONPATH", cfg.data_dir())
+        // WHY: device selection must reach the server (VOICELINK_MODEL__DEVICE),
+        // and must also survive watchdog-triggered restarts — hence the same
+        // injection in the watchdog spawn site below.
+        .env("VOICELINK_MODEL__DEVICE", &cfg.device)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
@@ -1633,6 +1644,7 @@ fn get_settings(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json
         "qwen3_enabled": cfg.qwen3_enabled,
         "qwen3_model_tier": cfg.qwen3_model_tier,
         "qwen3_installed": cfg.qwen3_installed,
+        "device": cfg.device,
     }))
 }
 
@@ -1645,6 +1657,7 @@ fn save_settings(
     qwen3_enabled: Option<bool>,
     qwen3_model_tier: Option<String>,
     qwen3_installed: Option<bool>,
+    device: Option<String>,
 ) -> Result<(), String> {
     let config = app.state::<Mutex<AppConfig>>();
     let mut cfg = config.lock().map_err(|e| e.to_string())?;
@@ -1667,6 +1680,13 @@ fn save_settings(
     }
     if let Some(installed) = qwen3_installed {
         cfg.qwen3_installed = installed;
+    }
+    if let Some(device) = device {
+        // Validate against the server's accepted values; fall back to "auto"
+        match device.as_str() {
+            "auto" | "cpu" | "cuda" | "amd" => cfg.device = device,
+            _ => cfg.device = "auto".to_string(),
+        }
     }
 
     cfg.save()?;
@@ -1854,6 +1874,10 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
             .args(["-c", bootstrap.trim()])
             .current_dir(cfg.data_dir())
             .env("PYTHONPATH", cfg.data_dir())
+            // WHY: duplicate of the injection in start_server — the watchdog
+            // re-spawns the server with its own environment, so the device
+            // setting must be injected here too to survive restarts.
+            .env("VOICELINK_MODEL__DEVICE", &cfg.device)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .creation_flags(0x00000008 | 0x08000000)
