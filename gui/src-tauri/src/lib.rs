@@ -109,19 +109,47 @@ fn default_qwen3_tier() -> String {
 }
 
 fn default_server_port() -> u16 {
-    7860
+    // DEV DEFAULT: debug builds target the repo's dev-data dir on port 7861
+    // so they never collide with (or accidentally talk to) an installed
+    // production deployment on 7860. Release keeps the production default.
+    if cfg!(debug_assertions) {
+        7861
+    } else {
+        7860
+    }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let base = std::env::var("ProgramData")
-            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        // DEV OVERRIDE: same env var as config_path() — a dev build with
+        // VOICELINK_DATA_DIR set points its data root at the repo checkout
+        // (see config_path() for WHY).
+        let data_dir = std::env::var("VOICELINK_DATA_DIR")
+            .unwrap_or_else(|_| {
+                // DEV DEFAULT: debug builds use the repo's dev-data dir
+                // instead of the installed deployment under ProgramData.
+                if cfg!(debug_assertions) {
+                    // CARGO_MANIFEST_DIR = <repo>/gui/src-tauri
+                    let manifest = env!("CARGO_MANIFEST_DIR");
+                    return PathBuf::from(manifest)
+                        .join("..")
+                        .join("..")
+                        .join("dev-data")
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(manifest).join("..").join("..").join("dev-data"))
+                        .to_string_lossy()
+                        .to_string();
+                }
+                let base = std::env::var("ProgramData")
+                    .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+                PathBuf::from(base)
+                    .join("VoiceLink")
+                    .to_string_lossy()
+                    .to_string()
+            });
         Self {
-            data_dir: PathBuf::from(base)
-                .join("VoiceLink")
-                .to_string_lossy()
-                .to_string(),
-            server_port: 7860,
+            data_dir,
+            server_port: default_server_port(),
             auto_start: false,
             qwen3_enabled: false,
             qwen3_model_tier: "standard".to_string(),
@@ -132,8 +160,25 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Config file lives at a fixed location so we can always find it
+    /// Config file lives at a fixed location so we can always find it.
+    ///
+    /// DEV OVERRIDE: setting the VOICELINK_DATA_DIR env var relocates the
+    /// entire data root (config.json, python/, server/, models/) — used to
+    /// run a dev build of the GUI against the repo checkout instead of the
+    /// installed deployment under ProgramData, without touching it.
     fn config_path() -> PathBuf {
+        if let Ok(dev_dir) = std::env::var("VOICELINK_DATA_DIR") {
+            return PathBuf::from(dev_dir).join("config.json");
+        }
+        // DEV DEFAULT: same location choice as Default::default()
+        if cfg!(debug_assertions) {
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            return PathBuf::from(manifest)
+                .join("..")
+                .join("..")
+                .join("dev-data")
+                .join("config.json");
+        }
         let base = std::env::var("ProgramData")
             .unwrap_or_else(|_| r"C:\ProgramData".to_string());
         PathBuf::from(base).join("VoiceLink").join("config.json")
@@ -170,11 +215,25 @@ impl AppConfig {
     }
 
     fn python_exe(&self) -> PathBuf {
+        // DEV OVERRIDE: point the GUI at any Python interpreter (e.g. the
+        // repo's .venv) without relocating the whole data dir. A venv puts
+        // python.exe under Scripts\, which data_dir\python\python.exe can't
+        // express — hence the dedicated override.
+        if let Ok(exe) = std::env::var("VOICELINK_PYTHON_EXE") {
+            return PathBuf::from(exe);
+        }
         self.python_dir().join("python.exe")
     }
 
     fn server_dir(&self) -> PathBuf {
         self.data_dir().join("server")
+    }
+
+    /// Base URL of the inference server, honoring the configured port.
+    /// Every HTTP call in the GUI goes through this so a non-default
+    /// `server_port` (e.g. dev's 7861) is respected everywhere.
+    fn server_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.server_port)
     }
 
     fn model_dir(&self) -> PathBuf {
@@ -308,13 +367,17 @@ fn check_gpu() -> Result<GpuInfo, String> {
 
 /// Check if the inference server is running and healthy
 #[tauri::command]
-async fn get_server_status() -> Result<ServerStatus, String> {
+async fn get_server_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<ServerStatus, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get("http://127.0.0.1:7860/v1/health").send().await {
+    match client.get(format!("{}/v1/health", base_url)).send().await {
         Ok(resp) => {
             if resp.status().is_success() {
                 let health: ServerHealth = resp.json().await.map_err(|e| e.to_string())?;
@@ -344,6 +407,10 @@ async fn get_voices(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<Vec<Vo
         let cfg = config.lock().unwrap();
         cfg.qwen3_enabled
     };
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -352,7 +419,7 @@ async fn get_voices(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<Vec<Vo
 
     // Fetch Kokoro voices
     let resp = client
-        .get("http://127.0.0.1:7860/v1/voices")
+        .get(format!("{}/v1/voices", base_url))
         .send()
         .await
         .map_err(|e| format!("Server not reachable: {}", e))?;
@@ -362,7 +429,7 @@ async fn get_voices(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<Vec<Vo
     // Fetch Qwen3 voices if enabled
     if qwen3_enabled {
         if let Ok(qwen3_resp) = client
-            .get("http://127.0.0.1:7860/v1/qwen3/speakers")
+            .get(format!("{}/v1/qwen3/speakers", base_url))
             .send()
             .await
         {
@@ -480,7 +547,15 @@ fn rename_voice(voice_id: String, new_name: String) -> Result<(), String> {
 
 /// Preview a voice by sending text to the server and playing it
 #[tauri::command]
-async fn preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, String> {
+async fn preview_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
+    voice_id: String,
+    text: String,
+) -> Result<Vec<u8>, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -494,7 +569,7 @@ async fn preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, String
     });
 
     let resp = client
-        .post("http://127.0.0.1:7860/v1/tts")
+        .post(format!("{}/v1/tts", base_url))
         .json(&body)
         .send()
         .await
@@ -589,10 +664,18 @@ fn run_elevated_powershell(commands: &str) -> Result<(), String> {
 /// the voice appears in all apps regardless of architecture.
 /// Tries direct HKLM write first; if not admin, elevates via UAC prompt.
 #[tauri::command]
-fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
+fn toggle_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
+    voice_id: String,
+    enabled: bool,
+) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;
 
+    let server_port = {
+        let cfg = config.lock().unwrap();
+        cfg.server_port.to_string()
+    };
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let token_name = format!("VoiceLink_{}", voice_id);
 
@@ -683,7 +766,7 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
                     token_key.set_value("", &final_name).map_err(|e| e.to_string())?;
                     token_key.set_value("CLSID", &clsid).map_err(|e| e.to_string())?;
                     token_key.set_value("VoiceLinkVoiceId", &voice_id).map_err(|e| e.to_string())?;
-                    token_key.set_value("VoiceLinkServerPort", &"7860").map_err(|e| e.to_string())?;
+                    token_key.set_value("VoiceLinkServerPort", &server_port).map_err(|e| e.to_string())?;
                     token_key.set_value("VoiceLinkModel", &model_name).map_err(|e| e.to_string())?;
 
                     let attrs_path = format!("{}\\Attributes", token_path);
@@ -716,7 +799,7 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
                 ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name '(Default)' -Value '{}'", reg_path, safe_name));
                 ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'CLSID' -Value '{}'", reg_path, clsid));
                 ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'VoiceLinkVoiceId' -Value '{}'", reg_path, safe_vid));
-                ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'VoiceLinkServerPort' -Value '7860'", reg_path));
+                ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'VoiceLinkServerPort' -Value '{}'", reg_path, server_port));
                 ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'VoiceLinkModel' -Value '{}'", reg_path, model_name));
                 ps_cmds.push(format!("New-Item -Path '{}' -Force | Out-Null", attrs_path));
                 ps_cmds.push(format!("Set-ItemProperty -Path '{}' -Name 'Name' -Value '{}'", attrs_path, safe_name));
@@ -762,14 +845,18 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
 
 /// Get list of Qwen3 speakers (built-in + custom)
 #[tauri::command]
-async fn qwen3_list_speakers() -> Result<serde_json::Value, String> {
+async fn qwen3_list_speakers(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get("http://127.0.0.1:7860/v1/qwen3/speakers")
+        .get(format!("{}/v1/qwen3/speakers", base_url))
         .send()
         .await
         .map_err(|e| format!("Server not reachable: {}", e))?;
@@ -780,19 +867,23 @@ async fn qwen3_list_speakers() -> Result<serde_json::Value, String> {
 
 /// Delete a cloned voice profile from the server
 #[tauri::command]
-async fn qwen3_delete_clone(voice_id: String) -> Result<(), String> {
+async fn qwen3_delete_clone(config: tauri::State<'_, Mutex<AppConfig>>, voice_id: String) -> Result<(), String> {
     // Extract the profile name from voice_id ("qwen3_custom_Name" -> "Name")
     let profile_name = voice_id
         .strip_prefix("qwen3_custom_")
         .unwrap_or(&voice_id);
 
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
 
     let resp = client
-        .delete(format!("http://127.0.0.1:7860/v1/qwen3/clone/{}", profile_name))
+        .delete(format!("{}/v1/qwen3/clone/{}", base_url, profile_name))
         .send()
         .await
         .map_err(|e| format!("Server error: {}", e))?;
@@ -807,6 +898,7 @@ async fn qwen3_delete_clone(voice_id: String) -> Result<(), String> {
 /// Clone a voice via Qwen3 — uploads reference audio + transcript to server
 #[tauri::command]
 async fn qwen3_clone_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
     name: String,
     transcript: String,
     audio_data: Vec<u8>,
@@ -815,6 +907,10 @@ async fn qwen3_clone_voice(
     description: String,
     preview_text: String,
 ) -> Result<Vec<u8>, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -844,7 +940,7 @@ async fn qwen3_clone_voice(
         .part("audio", audio_part);
 
     let resp = client
-        .post("http://127.0.0.1:7860/v1/qwen3/clone")
+        .post(format!("{}/v1/qwen3/clone", base_url))
         .multipart(form)
         .send()
         .await
@@ -863,10 +959,15 @@ async fn qwen3_clone_voice(
 /// Design a voice via Qwen3 from a text description (1.7B only)
 #[tauri::command]
 async fn qwen3_design_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
     name: String,
     description: String,
     sample_text: String,
 ) -> Result<Vec<u8>, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -879,7 +980,7 @@ async fn qwen3_design_voice(
     });
 
     let resp = client
-        .post("http://127.0.0.1:7860/v1/qwen3/design")
+        .post(format!("{}/v1/qwen3/design", base_url))
         .json(&body)
         .send()
         .await
@@ -897,7 +998,11 @@ async fn qwen3_design_voice(
 
 /// Preview a Qwen3 voice (built-in or custom) by synthesizing text
 #[tauri::command]
-async fn qwen3_preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, String> {
+async fn qwen3_preview_voice(config: tauri::State<'_, Mutex<AppConfig>>, voice_id: String, text: String) -> Result<Vec<u8>, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -910,7 +1015,7 @@ async fn qwen3_preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, 
     });
 
     let resp = client
-        .post("http://127.0.0.1:7860/v1/qwen3/tts")
+        .post(format!("{}/v1/qwen3/tts", base_url))
         .json(&body)
         .send()
         .await
@@ -928,7 +1033,11 @@ async fn qwen3_preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, 
 
 /// Narrate long text with Qwen3 TTS — supports language selection
 #[tauri::command]
-async fn qwen3_narrate(voice_id: String, text: String, language: String, speed: f64) -> Result<Vec<u8>, String> {
+async fn qwen3_narrate(config: tauri::State<'_, Mutex<AppConfig>>, voice_id: String, text: String, language: String, speed: f64) -> Result<Vec<u8>, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -942,7 +1051,7 @@ async fn qwen3_narrate(voice_id: String, text: String, language: String, speed: 
     });
 
     let resp = client
-        .post("http://127.0.0.1:7860/v1/qwen3/tts")
+        .post(format!("{}/v1/qwen3/tts", base_url))
         .json(&body)
         .send()
         .await
@@ -1005,14 +1114,18 @@ async fn save_wav_file(pcm_data: Vec<u8>) -> Result<Option<String>, String> {
 
 /// Get Qwen3 model status (loaded, tier, idle time)
 #[tauri::command]
-async fn qwen3_get_status() -> Result<serde_json::Value, String> {
+async fn qwen3_get_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let base_url = {
+        let cfg = config.lock().unwrap();
+        cfg.server_url()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get("http://127.0.0.1:7860/v1/qwen3/status")
+        .get(format!("{}/v1/qwen3/status", base_url))
         .send()
         .await
         .map_err(|e| format!("Server not reachable: {}", e))?;
@@ -1029,7 +1142,7 @@ async fn qwen3_get_status() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<SetupStatus, String> {
     // Collect file-based checks while holding the lock, then drop it before network IO
-    let (python_ok, deps_ok, server_ok, model_ok, data_dir_str) = {
+    let (python_ok, deps_ok, server_ok, model_ok, data_dir_str, base_url) = {
         let cfg = config.lock().unwrap();
 
         let python_ok = cfg.python_exe().exists();
@@ -1046,7 +1159,7 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
         // successfully downloaded from HuggingFace to the local HF cache.
         let model_ok = cfg.data_dir().join(".voices_ready").exists();
 
-        (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone())
+        (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone(), cfg.server_url())
     }; // MutexGuard dropped here — safe to do async IO now
 
     // Check if server is actually running via HTTP health endpoint (same as Dashboard)
@@ -1055,7 +1168,7 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
         .build()
     {
         Ok(client) => client
-            .get("http://127.0.0.1:7860/v1/health")
+            .get(format!("{}/v1/health", base_url))
             .send()
             .await
             .map_or(false, |r| r.status().is_success()),
@@ -1551,7 +1664,7 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     }
 
     // Check if already running
-    if std::net::TcpStream::connect("127.0.0.1:7860").is_ok() {
+    if std::net::TcpStream::connect(format!("127.0.0.1:{}", cfg.server_port)).is_ok() {
         return Ok(()); // Already running
     }
 
@@ -1581,8 +1694,13 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         .env("PYTHONPATH", cfg.data_dir())
         // WHY: device selection must reach the server (VOICELINK_MODEL__DEVICE),
         // and must also survive watchdog-triggered restarts — hence the same
-        // injection in the watchdog spawn site below.
+        // injection in the watchdog spawn site below. The server's listen
+        // port is driven by the same config value (VOICELINK_SERVER__PORT)
+        // so the GUI's configured port actually takes effect; without it
+        // the server always binds pydantic's 7860 default while the GUI
+        // would poll whatever server_port says — a silent mismatch.
         .env("VOICELINK_MODEL__DEVICE", &cfg.device)
+        .env("VOICELINK_SERVER__PORT", cfg.server_port.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
@@ -1801,16 +1919,23 @@ async fn server_watchdog(app: AppHandle) {
         }
 
         // Health check
-        let server_alive = match reqwest::Client::builder()
+        let server_alive = {
+            let base_url = app
+                .state::<Mutex<AppConfig>>()
+                .lock()
+                .map(|cfg| cfg.server_url())
+                .unwrap_or_else(|_| "http://127.0.0.1:7860".to_string());
+            match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
         {
             Ok(client) => client
-                .get("http://127.0.0.1:7860/v1/health")
+                .get(format!("{}/v1/health", base_url))
                 .send()
                 .await
                 .map_or(false, |r| r.status().is_success()),
             Err(_) => false,
+        }
         };
 
         if server_alive {
@@ -1876,8 +2001,10 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
             .env("PYTHONPATH", cfg.data_dir())
             // WHY: duplicate of the injection in start_server — the watchdog
             // re-spawns the server with its own environment, so the device
-            // setting must be injected here too to survive restarts.
+            // setting (and port) must be injected here too to survive
+            // restarts.
             .env("VOICELINK_MODEL__DEVICE", &cfg.device)
+            .env("VOICELINK_SERVER__PORT", cfg.server_port.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .creation_flags(0x00000008 | 0x08000000)

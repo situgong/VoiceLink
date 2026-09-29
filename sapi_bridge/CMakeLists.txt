@@ -143,6 +143,9 @@ target_compile_definitions(voicelink_sapi PRIVATE
 target_compile_options(voicelink_sapi PRIVATE
     /W4         # High warning level — catches many subtle bugs
     /WX         # Warnings are errors — enforces clean code
+    /utf-8      # Sources are UTF-8 (comments contain non-ASCII); without
+                # this, MSVC on CJK code pages (e.g. 936) reads them as
+                # GBK, trips C4819, and /WX turns that into a hard error.
     /permissive- # Strict standards conformance
     /Zc:__cplusplus # Report correct C++ version in __cplusplus macro
 )

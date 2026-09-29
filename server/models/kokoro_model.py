@@ -214,16 +214,39 @@ class KokoroModel(TTSModel):
             model = KModel()
             model.to(torch_device).eval()
             self._pipeline = KPipeline(lang_code=self._lang_code, model=model)
-        elif accepts_device:
-            self._pipeline = KPipeline(
-                lang_code=self._lang_code, device=torch_device
-            )
         else:
-            from kokoro import KModel
+            # ==================================================================
+            # WHY: on AMD ROCm (Windows), MIOpen's RNN kernels are
+            # JIT-compiled via HIPRTC, which needs MSVC C++ STL headers
+            # (type_traits, utility, ...). Without Visual Studio Build
+            # Tools + Windows SDK installed, that JIT fails with
+            # miopenStatusUnknownError on nn.LSTM. Disabling the cuDNN
+            # (=MIOpen on ROCm) backend makes PyTorch use its built-in
+            # RNN kernels instead, which run fine on HIP. NVIDIA CUDA
+            # users keep MIOpen/cuDNN untouched (torch.version.hip is
+            # None there, so the flag is never flipped).
+            # ==================================================================
+            if kind == "cuda":
+                import torch as _torch
 
-            model = KModel()
-            model.to(torch_device).eval()
-            self._pipeline = KPipeline(lang_code=self._lang_code, model=model)
+                if _torch.version.hip is not None:
+                    _torch.backends.cudnn.enabled = False
+                    logger.info(
+                        "AMD ROCm detected: MIOpen RNN kernels disabled "
+                        "(HIPRTC lacks MSVC STL headers without VS Build "
+                        "Tools; PyTorch built-in RNN kernels used instead)."
+                    )
+
+            if accepts_device:
+                self._pipeline = KPipeline(
+                    lang_code=self._lang_code, device=torch_device
+                )
+            else:
+                from kokoro import KModel
+
+                model = KModel()
+                model.to(torch_device).eval()
+                self._pipeline = KPipeline(lang_code=self._lang_code, model=model)
 
         self._loaded = True
 

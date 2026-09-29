@@ -7,6 +7,7 @@ build/
 build32/
 *.egg
 .venv/
+.venv312/
 
 # Build artifacts
 *.exe

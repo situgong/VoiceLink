@@ -1,0 +1,9 @@
+{
+  "data_dir": "D:\\projects\\0-26\\VoiceLink\\dev-data",
+  "server_port": 7861,
+  "auto_start": true,
+  "qwen3_enabled": false,
+  "qwen3_model_tier": "standard",
+  "qwen3_installed": false,
+  "device": "cuda"
+}
