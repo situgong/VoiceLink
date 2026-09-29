@@ -1,0 +1,44 @@
+# ============================================================================
+# VoiceLink Inference Server — Dependencies
+# ============================================================================
+#
+# Install with:  pip install -r server/requirements.txt
+#
+# NOTE: 'kokoro' must be installed separately first (it pins numpy==1.26.4)
+#       pip install kokoro soundfile
+#       pip install -r server/requirements.txt
+# ============================================================================
+
+# --- Web Framework ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0       # ASGI server with hot-reload
+
+# --- Configuration ---
+pydantic-settings>=2.7.0        # Settings from env vars / .env files
+pyyaml>=6.0                     # YAML config parsing
+
+# --- Audio ---
+soundfile>=0.13.0               # WAV/PCM I/O (already installed with kokoro)
+numpy>=1.26.0,<2.0              # Array operations (pinned by kokoro)
+
+# --- Utilities ---
+loguru>=0.7.0                   # Better logging with colors + rotation
+
+# ============================================================================
+# OPTIONAL: AMD / Intel GPU support on Windows via DirectML
+# ============================================================================
+# torch-directml enables AMD/Intel GPU inference on Windows via DirectML.
+#
+# WHY THIS IS COMMENTED OUT (not auto-installed):
+# - torch-directml requires torch<2.9 — its wheels only match older torch.
+# - torch arrives UNPINNED via kokoro, so a fresh install may pull torch>=2.9
+#   and the torch-directml wheel will mismatch / fail to load.
+#
+# Install order matters:
+#   1. pip install "torch<2.9"
+#   2. pip install torch-directml
+#
+# Without torch-directml, VOICELINK_MODEL__DEVICE=amd (and auto) fall back to
+# CPU with a logged warning — the server never crashes.
+# ============================================================================
+# torch-directml>=0.2.5.dev240914  # OPTIONAL: AMD/Intel GPU on Windows via DirectML; REQUIRES torch<2.9
